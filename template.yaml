@@ -1,0 +1,1018 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Metadata:
+  cfn-lint:
+    config:
+      regions:
+        - us-west-2
+Parameters:
+  InventoryIamRoleName:
+    Type: String
+    Description: The name of the IAM Role that will be present in each account inside the AWS organization that will be used for inventory scanning
+    Default: SteampipeInventory
+  ManagementAccountId:
+    Type: String
+    Description: The AWS Account ID of the management account
+  DeleteInventoryBucketObjectsOnStackDeletion:
+    Type: String
+    Default: 'True'
+    AllowedValues:
+      - 'True'
+      - 'False'
+  ErrorNotificationEmailAddress:
+    Type: String
+    Description: The email address that should receive notifications on process failure.
+  AlertNotificationEmailAddress:
+    Type: String
+    Description: The email address that should receive alerts on changes to data day over day. Only applies if alerts have been configured.
+  ImageVersion:
+    Type: String
+    Description: The version of the ECR image to use in the ECS Task Definition. Enter just the version number. Omit the leading "v".
+    Default: '1'
+Conditions:
+  ShouldDeleteInventoryBucketObjectsOnStackDeletion: !Equals [!Ref DeleteInventoryBucketObjectsOnStackDeletion, 'True']
+Resources:
+  # Lambda Layers
+  LayerBoto3:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      ContentUri: ./lambda-layers/boto3
+      CompatibleRuntimes:
+        - python3.8
+        - python3.7
+        - python3.9
+  LayerCrHelper:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      ContentUri: ./lambda-layers/crhelper
+      CompatibleRuntimes:
+        - python3.8
+        - python3.7
+        - python3.9
+
+  # KMS Keys
+  KeyInventory:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub 'key used for all resources in stack ${AWS::StackName}'
+      Enabled: true
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: kms:*
+            Resource: '*'
+          - Effect: Allow
+            Principal:
+              Service:
+                - s3.amazonaws.com
+                - sqs.amazonaws.com
+                - sns.amazonaws.com
+                - cloudwatch.amazonaws.com
+            Action:
+              - kms:GenerateDataKey
+              - kms:Decrypt
+            Resource: '*'
+          - Effect: Allow # from https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/encrypt-log-data-kms.html
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - kms:Encrypt*
+              - kms:Decrypt*
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:Describe*
+            Resource: '*'
+            Condition:
+              ArnLike:
+                kms:EncryptionContext:aws:logs:arn:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/ecs/${ClusterInventory}'
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-*'
+      PendingWindowInDays: 7
+
+  # SQS Queues
+  QueueLambdaDeadLetter:
+    Type: AWS::SQS::Queue
+    Properties:
+      KmsDataKeyReusePeriodSeconds: 3600 # 1 hour
+      KmsMasterKeyId: !Ref KeyInventory
+  QueueRawJsonProcessingDeadLetter:
+    Type: AWS::SQS::Queue
+    Properties:
+      KmsDataKeyReusePeriodSeconds: 3600 # 1 hour
+      KmsMasterKeyId: !Ref KeyInventory
+  QueueRawJsonProcessing:
+    Type: AWS::SQS::Queue
+    Properties:
+      KmsDataKeyReusePeriodSeconds: 3600 # 1 hour
+      KmsMasterKeyId: !Ref KeyInventory
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt QueueRawJsonProcessingDeadLetter.Arn
+        maxReceiveCount: 10
+      VisibilityTimeout: 300
+  QueueRawJsonProcessingPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref QueueRawJsonProcessing
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          Effect: Allow
+          Principal:
+            Service: sns.amazonaws.com
+          Action: sqs:SendMessage
+          Resource: !GetAtt QueueRawJsonProcessing.Arn
+          Condition:
+            ArnEquals:
+              aws:SourceArn: !Ref TopicRawJsonNotification
+  QueueTableProcessingDeadLetter:
+    Type: AWS::SQS::Queue
+    Properties:
+      KmsDataKeyReusePeriodSeconds: 3600 # 1 hour
+      KmsMasterKeyId: !Ref KeyInventory
+  QueueTableProcessing:
+    Type: AWS::SQS::Queue
+    Properties:
+      KmsDataKeyReusePeriodSeconds: 3600 # 1 hour
+      KmsMasterKeyId: !Ref KeyInventory
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt QueueTableProcessingDeadLetter.Arn
+        maxReceiveCount: 10
+      VisibilityTimeout: 900
+  QueueTableProcessingPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref QueueTableProcessing
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          Effect: Allow
+          Principal:
+            Service: sns.amazonaws.com
+          Action: sqs:SendMessage
+          Resource: !GetAtt QueueTableProcessing.Arn
+          Condition:
+            ArnEquals:
+              aws:SourceArn: !Ref TopicTablesNotification
+
+
+  # CloudWatch Alarms
+  AlarmQueueLambdaDeadLetter:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: 'There are failed messages in the lambda dead letter queue.'
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt QueueLambdaDeadLetter.QueueName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref TopicAlarm
+  AlarmQueueRawJsonProcessingDeadLetter:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: 'There are failed messages in the raw json processing dead letter queue.'
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt QueueRawJsonProcessingDeadLetter.QueueName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref TopicAlarm
+  AlarmQueueTableProcessingDeadLetter:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: 'There are failed messages in the table processing dead letter queue.'
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt QueueTableProcessingDeadLetter.QueueName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref TopicAlarm
+
+  # SNS Topics
+  TopicRawJsonNotification:
+    Type: AWS::SNS::Topic
+    Properties:
+      KmsMasterKeyId: !Ref KeyInventory
+  TopicRawJsonNotificationPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref TopicRawJsonNotification
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub 'arn:aws:s3:::${AWS::StackName}-bucketinventory-*'  # errors when creating the S3 notification events due to the policy not existing yet and getting S3 bucket creation error of "unable to validate the following destination configuration"
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Topics:
+        - !Ref TopicRawJsonNotification
+  TopicTablesNotification:
+    Type: AWS::SNS::Topic
+    Properties:
+      KmsMasterKeyId: !Ref KeyInventory
+  TopicTablesNotificationPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref TopicTablesNotification
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub 'arn:aws:s3:::${AWS::StackName}-bucketinventory-*'  # errors when creating the S3 notification events due to the policy not existing yet and getting S3 bucket creation error of "unable to validate the following destination configuration"
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Topics:
+        - !Ref TopicTablesNotification
+  TopicAlarm:
+    Type: AWS::SNS::Topic
+    Properties:
+      KmsMasterKeyId: !Ref KeyInventory
+      Subscription:
+        - Endpoint: !Ref ErrorNotificationEmailAddress
+          Protocol: email
+  TopicAlarmPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: sns:Publish
+            Resource: !Ref TopicAlarm
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub 'arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${AWS::StackName}-*'
+      Topics:
+        - !Ref TopicAlarm
+
+  # SNS Topic Subscriptions
+  SubscriptionRawJsonProcessing:
+    Type: AWS::SNS::Subscription
+    DependsOn:  # we want to avoid the s3 test event being delivered to SQS and processed by Lambda so we won't subscribe the queue to the topic until the Lambda is ready
+      - LambdaRawJsonProcessor
+      - LogGroupLambdaRawJsonProcessor
+    Properties:
+      Endpoint: !GetAtt QueueRawJsonProcessing.Arn
+      Protocol: sqs
+      TopicArn: !Ref TopicRawJsonNotification
+  SubscriptionTableProcessing:
+    Type: AWS::SNS::Subscription
+    DependsOn:  # we want to avoid the s3 test event being delivered to SQS and processed by Lambda so we won't subscribe the queue to the topic until the Lambda is ready
+      - LambdaCreateTables
+      - LogGroupLambdaCreateTables
+    Properties:
+      Endpoint: !GetAtt QueueTableProcessing.Arn
+      Protocol: sqs
+      TopicArn: !Ref TopicTablesNotification
+
+  # S3 Buckets
+  BucketInventory:
+    Type: AWS::S3::Bucket
+    DependsOn:
+      - TopicTablesNotificationPolicy
+      - TopicRawJsonNotificationPolicy
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - BucketKeyEnabled: true
+            ServerSideEncryptionByDefault:
+              KMSMasterKeyID: !Ref KeyInventory
+              SSEAlgorithm: aws:kms
+      LifecycleConfiguration:
+        Rules:
+          - ExpirationInDays: 10 # let's have AWS automatically remove the raw objects after 10 days = this will give a window of time to fix any issues
+            Prefix: raw/
+            Status: Enabled
+      NotificationConfiguration:
+        TopicConfigurations:
+          - Event: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: raw/
+                  - Name: suffix
+                    Value: json
+            Topic: !Ref TopicRawJsonNotification
+          - Event: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: config/
+                  - Name: suffix
+                    Value: txt
+            Topic: !Ref TopicTablesNotification
+      OwnershipControls: # this actually exists but cfn-lint has not been updated as of 2021-12-13 to support the property
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+  BucketAthenaQueryResults:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - BucketKeyEnabled: true
+            ServerSideEncryptionByDefault:
+              KMSMasterKeyID: !Ref KeyInventory
+              SSEAlgorithm: aws:kms
+      LifecycleConfiguration:
+        Rules:
+          - ExpirationInDays: 2 # let's have AWS automatically remove the objects  after 2 days = this will keep costs lower
+            Status: Enabled
+      OwnershipControls: # this actually exists but cfn-lint has not been updated as of 2021-12-13 to support the property
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+  BucketInventoryObjectNuker:
+    Type: Custom::S3ObjectNuker
+    Condition: ShouldDeleteInventoryBucketObjectsOnStackDeletion
+    Properties:
+      ServiceToken: !Ref LambdaCustomResources.Alias
+      BucketName: !Ref BucketInventory
+  BucketAthenaQueryResultsObjectNuker:
+    Type: Custom::S3ObjectNuker
+    Properties:
+      ServiceToken: !Ref LambdaCustomResources.Alias
+      BucketName: !Ref BucketAthenaQueryResults
+
+  # Athena
+  AthenaWorkgroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Description: daily inventory process
+      Name: !Ref AWS::StackName
+      RecursiveDeleteOption: true
+      State: ENABLED
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+        RequesterPaysEnabled: false
+        ResultConfiguration:
+          EncryptionConfiguration:
+            EncryptionOption: SSE_KMS
+            KmsKey: !Ref KeyInventory
+          OutputLocation: !Sub 's3://${BucketAthenaQueryResults}/'
+  AthenaDatabase:
+    Type: Custom::AthenaDatabase
+    DependsOn:
+      - BucketAthenaQueryResultsObjectNuker
+    Properties:
+      ServiceToken: !Ref LambdaCustomResources.Alias
+      Catalog: AwsDataCatalog
+      Database: !Ref AWS::StackName
+      Workgroup: !Ref AthenaWorkgroup
+
+  # Lambda Functions
+  LambdaCollectAccounts:
+    Type: AWS::Serverless::Function
+    Properties:
+      AutoPublishAlias: prod
+      CodeUri: ./lambda/collect-accounts
+      DeadLetterQueue:
+        TargetArn: !GetAtt QueueLambdaDeadLetter.Arn
+        Type: SQS
+      Description: Assumes a role in the master account to obtain a list of account in the AWS organization and then crafts a JSON response which will will instruct step functions to create a number of parallel steps via a MapState
+      Environment:
+        Variables:
+          subnet1: !Ref Subnet2Inventory
+          subnet2: !Ref Subnet2Inventory
+          sg: !Ref SecurityGroupEcsTasks
+          task_definition_family: steampipe-inventory
+          cluster: !Ref ClusterInventory
+          master_account_role_arn: !Sub 'arn:aws:iam::${ManagementAccountId}:role/${InventoryIamRoleName}'
+      Events:
+        DailySchedule:
+          Type: Schedule
+          Properties:
+            Schedule: cron(0 0 * * ? *)
+            Enabled: true
+            DeadLetterConfig:
+              Arn: !GetAtt QueueLambdaDeadLetter.Arn
+      Handler: index.handler
+      Layers:
+        - !Ref LayerBoto3
+      MemorySize: 128
+      Policies:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Resource: !Sub 'arn:aws:iam::${ManagementAccountId}:role/${InventoryIamRoleName}'
+          - Effect: Allow
+            Action: ecs:RunTask
+            Resource: !Ref TaskDefinitionInventory
+            Condition:
+              ArnEquals:
+                ecs:Cluster: !GetAtt ClusterInventory.Arn
+          - Effect: Allow
+            Action: ecs:DescribeTaskDefinition
+            Resource: '*'
+          - Effect: Allow
+            Action: iam:PassRole
+            Resource:
+              - !GetAtt RoleEcsTaskExecution.Arn
+              - !GetAtt RoleEcsTask.Arn
+            Condition:
+              StringEquals:
+                iam:PassedToService: ecs-tasks.amazonaws.com
+          - Effect: Allow
+            Action: sqs:SendMessage
+            Resource: !GetAtt QueueLambdaDeadLetter.Arn
+          - Effect: Allow
+            Action:
+              - kms:GenerateDataKey
+            Resource: !GetAtt KeyInventory.Arn
+      ReservedConcurrentExecutions: 1
+      Runtime: python3.9
+      Timeout: 120 # 2 minutes
+  LambdaRawJsonProcessor:
+    Type: AWS::Serverless::Function
+    Properties:
+      AutoPublishAlias: prod
+      CodeUri: ./lambda/raw-json-processor
+      Description: invoked via SQS and processes the raw JSON output of Steampipe into something more consumable by Athena and writes the results back to S3
+      Environment:
+        Variables:
+          bucket: !Ref BucketInventory
+          prefix: processed
+      Events:
+        SqsEvent:
+          Type: SQS
+          Properties:
+            BatchSize: 10
+            Enabled: true
+            Queue: !GetAtt QueueRawJsonProcessing.Arn
+      Handler: index.handler
+      Layers:
+        - !Ref LayerBoto3
+      MemorySize: 1024
+      Policies:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:PutObject
+              - s3:PutObjectAcl
+            Resource: !Sub '${BucketInventory.Arn}/processed/*'
+          - Effect: Allow
+            Action: s3:GetObject
+            Resource: !Sub '${BucketInventory.Arn}/raw/*'
+          - Effect: Allow # from https://docs.aws.amazon.com/lambda/latest/dg/with-sqs.html#events-sqs-permissions
+            Action:
+              - sqs:ReceiveMessage
+              - sqs:DeleteMessage
+              - sqs:GetQueueAttributes
+            Resource: !GetAtt QueueRawJsonProcessing.Arn
+          - Effect: Allow
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource: !GetAtt KeyInventory.Arn
+      ReservedConcurrentExecutions: 20  # based on metrics reviewed we didn't get above 11 concurrent executions so 20 gives a nice buffer
+      Runtime: python3.9
+      Timeout: 300 # 5 minutes
+  LambdaCreateTables:
+    Type: AWS::Serverless::Function
+    Properties:
+      AutoPublishAlias: prod
+      CodeUri: ./lambda/create-tables
+      Description: invoked via SQS and will create any necessary tables in Athena based on the metadata available for the columns of the tables
+      Environment:
+        Variables:
+          bucket: !Ref BucketInventory
+          workgroup: !Ref AthenaWorkgroup
+          database: !Ref AthenaDatabase
+          prefix: processed
+      Events:
+        SqsEvent:  # using S3 -> SNS -> SQS -> Lambda here to avoid a circular dependency when going direct S3 -> Lambda - we don't really care about processing the SQS events themselves as much as using SQS as the trigger to take action
+          Type: SQS
+          Properties:
+            BatchSize: 10
+            Enabled: true
+            Queue: !GetAtt QueueTableProcessing.Arn
+      Handler: index.handler
+      Layers:
+        - !Ref LayerBoto3
+      MemorySize: 512
+      Policies:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action: s3:GetObject
+            Resource:
+              - !Sub '${BucketInventory.Arn}/config/tables.txt'
+              - !Sub '${BucketInventory.Arn}/config/table_metadata.json'
+          - Effect: Allow
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource: !GetAtt KeyInventory.Arn
+          - Effect: Allow # from https://docs.aws.amazon.com/lambda/latest/dg/with-sqs.html#events-sqs-permissions
+            Action:
+              - sqs:ReceiveMessage
+              - sqs:DeleteMessage
+              - sqs:GetQueueAttributes
+            Resource: !GetAtt QueueTableProcessing.Arn
+          - Effect: Allow
+            Action:  # have I said recently how much I just LOVE athena/glue permissions? ugh
+              - athena:GetDatabase
+              - athena:ListTableMetadata
+              - glue:GetDatabase
+              - glue:GetTables
+              - glue:CreateDatabase
+              - glue:GetTable
+              - glue:CreateTable
+              - glue:GetDatabases
+            Resource:
+              - !Sub 'arn:aws:athena:${AWS::Region}:${AWS::AccountId}:datacatalog/AwsDataCatalog'
+              - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+              - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${AWS::StackName}'
+              - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/default'
+              - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${AWS::StackName}/*'
+          - Effect: Allow
+            Action:
+              - athena:StartQueryExecution
+              - athena:GetQueryExecution
+            Resource: !Sub 'arn:aws:athena:${AWS::Region}:${AWS::AccountId}:workgroup/${AthenaWorkgroup}'
+          - Effect: Allow
+            Action:
+              - s3:GetBucketLocation
+              - s3:GetObject
+              - s3:ListBucket
+              - s3:ListBucketMultipartUploads
+              - s3:ListMultipartUploadParts
+              - s3:AbortMultipartUpload
+              - s3:PutObject
+              - s3:PutObjectAcl
+            Resource:
+              - !GetAtt BucketAthenaQueryResults.Arn
+              - !Sub '${BucketAthenaQueryResults.Arn}/*'
+      ReservedConcurrentExecutions: 1  # we only really need/want one function running at a time
+      Runtime: python3.9
+      Timeout: 900 # 15 minutes
+  LambdaCustomResources:
+    Type: AWS::Serverless::Function
+    DependsOn:
+      - LogGroupCustomResources
+    Properties:
+      AutoPublishAlias: prod
+      CodeUri: ./lambda/custom-resources
+      Description: custom cloudformation resources
+      FunctionName: !Sub '${AWS::StackName}-custom-resources'  # hardcoded to get the log group resource working correctly
+      Handler: index.handler
+      Layers:
+        - !Ref LayerBoto3
+        - !Ref LayerCrHelper
+      MemorySize: 512
+      Policies:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource: !GetAtt KeyInventory.Arn
+          - Effect: Allow
+            Action:  # have I said recently how much I just LOVE athena/glue permissions? ugh
+              - athena:GetDatabase
+              - athena:ListTableMetadata
+              - glue:GetDatabase
+              - glue:GetTables
+              - glue:CreateDatabase
+              - glue:GetTable
+              - glue:CreateTable
+              - glue:GetDatabases
+              - glue:DeleteDatabase
+            Resource:
+              - !Sub 'arn:aws:athena:${AWS::Region}:${AWS::AccountId}:datacatalog/AwsDataCatalog'
+              - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+              - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${AWS::StackName}'
+              - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/default'
+              - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${AWS::StackName}/*'
+              - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:userDefinedFunction/${AWS::StackName}/*'
+          - Effect: Allow
+            Action:
+              - athena:StartQueryExecution
+              - athena:GetQueryExecution
+            Resource: !Sub 'arn:aws:athena:${AWS::Region}:${AWS::AccountId}:workgroup/${AthenaWorkgroup}'
+          - Effect: Allow
+            Action:
+              - s3:GetBucketLocation
+              - s3:GetObject
+              - s3:AbortMultipartUpload
+              - s3:PutObject
+              - s3:PutObjectAcl
+              - s3:List*
+              - s3:DeleteObject
+            Resource:
+              - !GetAtt BucketAthenaQueryResults.Arn
+              - !Sub '${BucketAthenaQueryResults.Arn}/*'
+          - Effect: Allow
+            Action:
+              - ecr:ListImages
+              - ecr:BatchDeleteImage
+            Resource: !GetAtt RepositoryInventory.Arn
+          - Effect: Allow
+            Action:
+              - s3:List*
+              - s3:DeleteObject
+            Resource:
+              - !GetAtt BucketInventory.Arn
+              - !Sub '${BucketInventory.Arn}/*'
+      ReservedConcurrentExecutions: 5  # we only really need/want one function running at a time
+      Runtime: python3.9
+      Timeout: 900 # 15 minutes
+
+  # ECR
+  RepositoryInventory:
+    Type: AWS::ECR::Repository
+    Properties:
+      EncryptionConfiguration:
+        EncryptionType: KMS
+        KmsKey: !Ref KeyInventory
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      ImageTagMutability: IMMUTABLE
+  RepositoryImageCleanup:  # this will delete any images in the ecr repository so the repository can be deleted when the stack is deleted
+    Type: Custom::EcrImageCleanup
+    Properties:
+      ServiceToken: !Ref LambdaCustomResources.Alias
+      Repository: !Ref RepositoryInventory
+
+  # IAM
+  RoleEcsTaskExecution:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2008-10-17
+        Statement:
+          Effect: Allow
+          Principal:
+            Service: ecs-tasks.amazonaws.com
+          Action: sts:AssumeRole
+      Description: Used by Inventory ECS Tasks as the execution role
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: inline
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: kms:Decrypt
+                Resource: !GetAtt KeyInventory.Arn
+  RoleEcsTask:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2008-10-17
+        Statement:
+          Effect: Allow
+          Principal:
+            Service: ecs-tasks.amazonaws.com
+          Action: sts:AssumeRole
+      Description: Used by Inventory ECS Tasks as role that will be applied to tasks, like EC2 intance role
+      Policies:
+        - PolicyName: inline
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                Resource: !Sub '${BucketInventory.Arn}/raw/*'
+              - Effect: Allow
+                Action: sts:AssumeRole
+                Resource: !Sub 'arn:aws:iam::*:role/${InventoryIamRoleName}'
+              - Effect: Allow
+                Action:
+                  - kms:GenerateDataKey
+                  - kms:Decrypt
+                Resource: !GetAtt KeyInventory.Arn
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub '${BucketInventory.Arn}/config/*'
+
+  # CloudWatch Logs
+  LogGroupEcsCluster:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      KmsKeyId: !GetAtt KeyInventory.Arn
+      LogGroupName: !Sub '/ecs/${ClusterInventory}'
+      RetentionInDays: 14
+  LogGroupLambdaCollectAccounts:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      KmsKeyId: !GetAtt KeyInventory.Arn
+      LogGroupName: !Sub '/aws/lambda/${LambdaCollectAccounts}'
+      RetentionInDays: 14
+  LogGroupLambdaRawJsonProcessor:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      KmsKeyId: !GetAtt KeyInventory.Arn
+      LogGroupName: !Sub '/aws/lambda/${LambdaRawJsonProcessor}'
+      RetentionInDays: 14
+  LogGroupLambdaCreateTables:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      KmsKeyId: !GetAtt KeyInventory.Arn
+      LogGroupName: !Sub '/aws/lambda/${LambdaCreateTables}'
+      RetentionInDays: 14
+  LogGroupCustomResources:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      KmsKeyId: !GetAtt KeyInventory.Arn
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-custom-resources'
+      RetentionInDays: 14
+
+
+  # ECS
+  ClusterInventory:
+    Type: AWS::ECS::Cluster
+    Properties:
+      CapacityProviders:
+        - FARGATE
+  TaskDefinitionInventory:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      ContainerDefinitions:
+        - Command:
+            - './start.sh'
+          Environment:
+            - Name: INVENTORY_ROLE
+              Value: !Ref InventoryIamRoleName
+            - Name: INVENTORY_BUCKET
+              Value: !Ref BucketInventory
+            - Name: STEAMPIPE_UPDATE_CHECK
+              Value: 'false'
+          Essential: true
+          Image: !Sub '${RepositoryInventory.RepositoryUri}:v${ImageVersion}'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Sub '/ecs/${ClusterInventory}'
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          Name: inventory
+          ReadonlyRootFilesystem: false
+          WorkingDirectory: '/home/steampipe'
+      Cpu: 1024
+      ExecutionRoleArn: !GetAtt RoleEcsTaskExecution.Arn
+      Family: steampipe-inventory
+      Memory: 2048
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      TaskRoleArn: !GetAtt RoleEcsTask.Arn
+
+  # VPC (note VPC flow logs resource was removed before making this open source since each deployment is different)
+  VpcInventory:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/22
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: inventory
+  IgwInventory:
+      Type: AWS::EC2::InternetGateway
+  IgwAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref IgwInventory
+      VpcId: !Ref VpcInventory
+  Subnet1Inventory:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VpcInventory
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      CidrBlock: 10.0.0.0/24
+      MapPublicIpOnLaunch: true
+  Subnet2Inventory:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VpcInventory
+      AvailabilityZone: !Select [ 1, !GetAZs '' ]
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+  RouteTableInventory:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VpcInventory
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IgwAttachment
+    Properties:
+      RouteTableId: !Ref RouteTableInventory
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref IgwInventory
+  Subnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref RouteTableInventory
+      SubnetId: !Ref Subnet1Inventory
+  Subnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref RouteTableInventory
+      SubnetId: !Ref Subnet2Inventory
+  VpcEndpointS3:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      # PolicyDocument:  # TODO - figure out the correct policy - no straightforward when running select * from aws_s3_bucket for instance unless we just open it up to all buckets
+      RouteTableIds:
+        - !Ref RouteTableInventory
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcEndpointType: Gateway
+      VpcId: !Ref VpcInventory
+  SecurityGroupEcsTasks:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: will be the SG attached to all ECS tasks created under this stack
+      VpcId: !Ref VpcInventory
+
+
+
+  # alerting infra
+  AlertsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      BillingMode: PAY_PER_REQUEST  # on demand
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH  # partition
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        KMSMasterKeyId: !Ref KeyInventory
+        SSEEnabled: true
+        SSEType: KMS
+  LogGroupLambdaAlerts:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      KmsKeyId: !GetAtt KeyInventory.Arn
+      LogGroupName: !Sub '/aws/lambda/${LambdaAlerts}'
+      RetentionInDays: 14
+  TopicAlerts:
+    Type: AWS::SNS::Topic
+    Properties:
+      KmsMasterKeyId: !Ref KeyInventory
+      Subscription:
+        - Endpoint: !Ref AlertNotificationEmailAddress
+          Protocol: email
+  LambdaAlerts:
+    Type: AWS::Serverless::Function
+    Properties:
+      AutoPublishAlias: prod
+      CodeUri: ./lambda/alerts
+      DeadLetterQueue:
+        TargetArn: !GetAtt QueueLambdaDeadLetter.Arn
+        Type: SQS
+      Description: runs queries against the inventory data and delivers alerts via SNS based on the results of the query
+      Environment:
+        Variables:
+          workgroup: !Ref AthenaWorkgroup
+          database: !Ref AthenaDatabase
+          catalog: AwsDataCatalog
+          table: !Ref AlertsTable
+          topic: !Ref TopicAlerts
+      Events:
+        DailySchedule:
+          Type: Schedule
+          Properties:
+            Schedule: cron(0 2 * * ? *)
+            Enabled: true
+            DeadLetterConfig:
+              Arn: !GetAtt QueueLambdaDeadLetter.Arn
+      Handler: index.handler
+      Layers:
+        - !Ref LayerBoto3
+      MemorySize: 256
+      Policies:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action: sqs:SendMessage
+            Resource: !GetAtt QueueLambdaDeadLetter.Arn
+          - Effect: Allow
+            Action:  # from https://docs.aws.amazon.com/kms/latest/developerguide/services-dynamodb.html#dynamodb-authz
+              - kms:GenerateDataKey*
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:DescribeKey
+              - kms:CreateGrant
+            Resource: !GetAtt KeyInventory.Arn
+            Condition:
+              StringLike:
+                kms:viaService:
+                  - dynamodb.*.amazonaws.com
+                  - s3.*.amazonaws.com
+                  - sns.*.amazonaws.com
+          - Effect: Allow
+            Action: # have I said recently how much I just LOVE athena/glue permissions? ugh
+              - athena:GetDatabase
+              - athena:ListTableMetadata
+              - glue:GetDatabase
+              - glue:GetTables
+              - glue:GetTable
+              - glue:GetDatabases
+            Resource:
+              - !Sub 'arn:aws:athena:${AWS::Region}:${AWS::AccountId}:datacatalog/AwsDataCatalog'
+              - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+              - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${AWS::StackName}'
+              - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/default'
+              - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${AWS::StackName}/*'
+          - Effect: Allow
+            Action:
+              - athena:StartQueryExecution
+              - athena:GetQueryExecution
+              - athena:GetQueryResults
+            Resource: !Sub 'arn:aws:athena:${AWS::Region}:${AWS::AccountId}:workgroup/${AthenaWorkgroup}'
+          - Effect: Allow
+            Action:
+              - s3:GetBucketLocation
+              - s3:GetObject
+              - s3:ListBucket
+              - s3:ListBucketMultipartUploads
+              - s3:ListMultipartUploadParts
+              - s3:AbortMultipartUpload
+              - s3:PutObject
+              - s3:PutObjectAcl
+            Resource:
+              - !GetAtt BucketAthenaQueryResults.Arn
+              - !Sub '${BucketAthenaQueryResults.Arn}/*'
+          - Effect: Allow
+            Action:
+              - s3:GetBucketLocation
+              - s3:GetObject
+              - s3:ListBucket
+            Resource:
+              - !GetAtt BucketInventory.Arn
+              - !Sub '${BucketInventory.Arn}/processed/*'
+          - Effect: Allow
+            Action: sns:Publish
+            Resource: !Ref TopicAlerts
+          - Effect: Allow
+            Action: dynamodb:Scan
+            Resource: !GetAtt AlertsTable.Arn
+      Runtime: python3.9
+      Timeout: 300 # 5 minutes
+
+
+Outputs:
+  EcrRepository:
+    Value: !GetAtt RepositoryInventory.RepositoryUri
+  KeyInventoryArn:
+    Value: !GetAtt KeyInventory.Arn

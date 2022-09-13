@@ -1,0 +1,25 @@
+AWSTemplateFormatVersion: 2010-09-09
+Resources:
+  CloudFormationBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'cloudformation-templates-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - BucketKeyEnabled: true
+            ServerSideEncryptionByDefault:
+              KMSMasterKeyID: alias/aws/s3
+              SSEAlgorithm: aws:kms
+      OwnershipControls: # this actually exists but cfn-lint has not been updated as of 2021-12-13 to support the property
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+Outputs:
+  CloudFormationBucketName:
+    Value: !Ref CloudFormationBucket
+    Export:
+      Name: CloudFormationBucketName

@@ -1,0 +1,23 @@
+FROM amazonlinux:latest
+
+USER root:0
+RUN yum update -y -q && \
+	yum install tar gzip shadow-utils util-linux awscli -y -q && \
+	/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/turbot/steampipe/main/install.sh)" && \
+ 	useradd -m steampipe && \
+	chown -R steampipe /home/steampipe
+
+
+# Install the aws plugin for Steampipe (as steampipe user).
+USER steampipe:0
+RUN	steampipe plugin install aws && \
+	mkdir /home/steampipe/inventory
+COPY ./start.sh /home/steampipe/start.sh
+COPY ./aws.spc /home/steampipe/.steampipe/config/aws.spc
+COPY ./aws.spc.single-region /home/steampipe/.steampipe/config/aws.spc.single-region
+WORKDIR /home/steampipe
+
+	
+
+
+

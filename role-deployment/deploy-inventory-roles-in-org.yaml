@@ -1,0 +1,47 @@
+AWSTemplateFormatVersion: 2010-09-09
+Parameters:
+  RootOuId:
+    Description: The ID of the Root OU where stackset will apply
+    Type: String
+  InventoryAccountId:
+    Description: The 12 digit AWS account ID where the inventory collection process will run - the Inventory role will trust this account for AssumeRole
+    Type: String
+Resources:
+  ManagementAccountStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      Parameters:
+        InventoryAccountId: !Ref InventoryAccountId
+      TemplateURL: !Sub
+        - 'https://${BucketName}.s3.amazonaws.com/inventory-role.yaml'
+        - BucketName: !ImportValue CloudFormationBucketName
+      TimeoutInMinutes: 5
+  StackSet:
+    Type: AWS::CloudFormation::StackSet
+    Properties:
+      AutoDeployment:
+        Enabled: true
+        RetainStacksOnAccountRemoval: false
+      CallAs: SELF
+      Capabilities:
+        - CAPABILITY_IAM
+        - CAPABILITY_NAMED_IAM
+      Description: Will deploy required IAM Roles in all accounts in the organization
+      OperationPreferences:
+        FailureToleranceCount: 10
+        MaxConcurrentCount: 100
+        RegionConcurrencyType: PARALLEL
+      Parameters:
+        - ParameterKey: InventoryAccountId
+          ParameterValue: !Ref InventoryAccountId
+      PermissionModel: SERVICE_MANAGED
+      StackInstancesGroup:
+        - DeploymentTargets:
+            OrganizationalUnitIds:
+              - !Ref RootOuId  # deploy to all AWS accounts (less the mgmt account as stacksets can't do that) so the inventory process will work as expected
+          Regions:
+            - us-east-1  # as IAM resources are global we just need to deploy in 1 region
+      StackSetName: steampipe-inventory
+      TemplateURL: !Sub
+        - 'https://${BucketName}.s3.amazonaws.com/inventory-role.yaml'
+        - BucketName: !ImportValue CloudFormationBucketName

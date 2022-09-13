@@ -1,0 +1,5 @@
+{
+ "id": "guardduty",
+ "subject": "GuardDuty Alert from Inventory Data",
+ "query": "with today as (select * from guardduty_finding_snapshots where inventory_snapshot = date_format(current_timestamp, '%Y/%m/%d')), yesterday as (select * from guardduty_finding_snapshots where inventory_snapshot = date_format(current_timestamp - interval '1' day, '%Y/%m/%d')) select a.* from today a left join yesterday b on a.arn = b.arn where b.arn is null"
+}

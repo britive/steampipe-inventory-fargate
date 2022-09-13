@@ -1,0 +1,8 @@
+connection "aws" {
+  plugin    = "aws"
+  regions   = ["us-east-1"]
+}
+
+options "general" {
+  update_check = false
+}
